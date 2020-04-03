@@ -1,0 +1,404 @@
+-- таблица всех проектов по тестированию
+CREATE TABLE project(
+    id serial NOT NULL PRIMARY KEY,
+    name text NOT NULL,
+    deleted boolean NOT NULL
+);
+
+-- таблица групп операций. связана с таблицей проектов
+CREATE TABLE group_oper(
+    id serial NOT NULL PRIMARY KEY,
+    id_project integer NOT NULL,
+    name text NOT NULL,
+    common boolean NOT NULL,
+    deleted boolean NOT NULL,
+    FOREIGN KEY (id_project)
+        REFERENCES project (id)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE
+);
+
+-- таблица операций. связана с таблицей групп операций и проектами
+CREATE TABLE operation(
+    id serial NOT NULL PRIMARY KEY,
+    id_group integer NOT NULL,
+    name text NOT NULL,
+    oper text NOT NULL,
+    deleted boolean NOT NULL,
+    FOREIGN KEY (id_group)
+        REFERENCES group_oper (id)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE
+);
+
+-- таблица глобальных параметров для автоматизированных сценариев
+CREATE TABLE autotest_params(
+    name text NOT NULL,
+    value text,
+    user_nick text NOT NULL,
+    UNIQUE (name, user_nick)
+);
+
+-- таблица данных для интеграции с репозиторием автоматизированных сценариев по проектам
+create table git_scenarios(
+	id serial NOT NULL PRIMARY KEY,
+	id_project integer NOT NULL,
+	url text NOT NULL,
+	login text NOT NULL,
+	pass text NOT NULL,
+	folder text NOT NULL,
+    deleted boolean NOT NULL,
+	FOREIGN KEY(id_project)
+		REFERENCES project (id)
+		ON UPDATE CASCADE
+        ON DELETE CASCADE
+);
+
+----------------------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------------------
+-- добавление новой операции
+CREATE OR REPLACE FUNCTION oper_insert (name_project text, name_group text, common_group text, name_oper text, json_oper text) RETURNS integer AS
+$BODY$
+DECLARE
+	id_gr integer;
+	is_exists boolean;
+begin
+    if CAST(common_group AS boolean) then
+		SELECT gr.id INTO id_gr FROM group_oper gr
+		WHERE gr.name = name_group
+			and gr.common = true
+			and gr.deleted = false;
+	else
+		SELECT gr.id INTO id_gr
+		FROM group_oper gr
+			join project pr on pr.id = gr.id_project
+		WHERE pr.name = name_project
+			and pr.deleted = false
+			and gr.name = name_group
+			and gr.common = false
+			and gr.deleted = false;
+	END IF;
+
+	select exists(SELECT op.id FROM operation op
+		WHERE op.name = name_oper
+			and op.deleted = false
+			and op.id_group = id_gr) INTO is_exists;
+
+	if is_exists then
+		RETURN 1;
+	else
+		INSERT INTO operation(id_group, name, oper, deleted) VALUES (id_gr, name_oper, json_oper, 'false');
+	END IF;
+
+	RETURN 0;
+end
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- добавление нового проекта
+CREATE OR REPLACE FUNCTION project_insert (name_project text) RETURNS integer AS
+$BODY$
+DECLARE
+    id_pr integer;
+begin
+    IF not exists(select id from project where name = name_project and deleted=false) THEN
+      INSERT INTO project(name, deleted) VALUES (name_project, false) RETURNING id into id_pr;
+	  return id_pr;
+    ELSE
+      RETURN 0;
+    END IF;
+end
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- удаление проекта и всех групп и операций в нем
+CREATE OR REPLACE procedure project_delete (name_project text) AS
+$BODY$
+DECLARE
+    id_pr integer;
+begin
+    -- получаем id проекта
+    SELECT pr.id INTO id_pr
+	FROM project pr
+	WHERE pr.name = name_project
+		and pr.deleted = false;
+
+    -- update проекта всех групп и операций
+	update project pr set deleted = true where pr.id = id_pr;
+	update group_oper gr set deleted = true where gr.id_project = id_pr and gr.common = false;
+	update operation op set deleted = true where op.id_group in (select gr.id from group_oper gr where gr.id_project = id_pr and gr.common = false);
+end
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- все проектные группы и операции
+CREATE OR REPLACE FUNCTION project_tree_select (name_project text)
+RETURNS TABLE(name_group text, common text, name_operation text) AS
+$BODY$
+begin
+    return query SELECT gr.name as name_group, CAST(gr.common AS TEXT),  CAST(array_to_json(array_agg(op.name)) AS TEXT) AS name_operation
+                 FROM group_oper gr
+                   left join (select oper.name, oper.id_group from operation oper where oper.deleted = false) op on gr.id = op.id_group
+                   join project pr on pr.id = gr.id_project
+                 WHERE pr.name = name_project
+                   and gr.deleted = false
+                   and gr.common = false
+                 GROUP BY gr.name, gr.common;
+end
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- все общие группы и операции
+CREATE OR REPLACE FUNCTION common_tree_select ()
+RETURNS TABLE(name_group text, common text, name_operation text) AS
+$BODY$
+begin
+    return query SELECT gr.name as name_group, CAST(gr.common AS TEXT),  CAST(array_to_json(array_agg(op.name)) AS TEXT) AS name_operation
+                 FROM group_oper gr
+                   left join (select oper.name, oper.id_group from operation oper where oper.deleted = false) op on gr.id = op.id_group
+                 WHERE
+                   gr.deleted = false
+                   and gr.common = true
+                 GROUP BY gr.name, gr.common;
+end
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- добавление группы операций
+CREATE OR REPLACE FUNCTION group_oper_insert(name_pr text, name_gr text, is_common text) RETURNS integer AS
+$BODY$
+DECLARE
+    id_gr integer;
+BEGIN
+	IF CAST(is_common AS boolean) THEN
+		IF exists(select * from group_oper g where g.name = name_gr and g.common = true and g.deleted = false) THEN
+		  RETURN 0;
+		END IF;
+	ELSE
+		IF exists(select * from group_oper g  join project pr on pr.id = g.id_project where g.name = name_gr and pr.name = name_pr and g.deleted = false) THEN
+		  RETURN 0;
+		END IF;
+	END IF;
+
+	INSERT INTO group_oper(id_project, name, common, deleted) SELECT id, name_gr, CAST(is_common AS boolean), false from project WHERE name=name_pr and deleted = false RETURNING id into id_gr;
+
+	RETURN id_gr;
+END
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- удаление группы и операций в ней
+CREATE OR REPLACE procedure group_oper_delete (name_project text, name_group text, common_group text) AS
+$BODY$
+DECLARE
+    id_gr integer;
+begin
+    -- получаем id группы
+	if CAST(common_group AS boolean) then
+		SELECT gr.id INTO id_gr
+		FROM group_oper gr
+		WHERE gr.name = name_group
+			and gr.common = true
+			and gr.deleted = false;
+	else
+		SELECT gr.id INTO id_gr
+		FROM group_oper gr
+			join project pr on pr.id = gr.id_project
+		WHERE pr.name = name_project
+			and pr.deleted = false
+			and gr.name = name_group
+			and gr.common = false
+			and gr.deleted = false;
+	END IF;
+
+    -- update группы и всех операций в ней
+	update group_oper gr set deleted = true where gr.id = id_gr;
+	update operation op set deleted = true where op.id_group = id_gr;
+end
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- обновление группы операций
+CREATE OR REPLACE FUNCTION group_oper_update(name_pr text, name_gr text, new_name_gr text, is_common text) RETURNS integer AS
+$BODY$
+DECLARE
+    id_gr integer;
+BEGIN
+	IF CAST(is_common AS boolean) THEN
+		IF exists(select * from group_oper g where g.name = new_name_gr and g.common = true and g.deleted = false) THEN
+		  id_gr = 0;
+		else
+			UPDATE group_oper
+			SET name = new_name_gr
+			WHERE name = name_gr and common = true RETURNING id into id_gr;
+		END IF;
+	ELSE
+		IF exists(select * from group_oper g  join project pr on pr.id = g.id_project where g.name = new_name_gr and g.common = false and pr.name = name_pr and g.deleted = false) THEN
+		  id_gr = 0;
+		else
+			UPDATE group_oper
+			SET name = new_name_gr
+			WHERE name = name_gr
+				and common = false
+				and id_project = (SELECT id from project WHERE name = name_pr and deleted = false) RETURNING id into id_gr;
+		END IF;
+	END IF;
+
+	RETURN id_gr;
+END
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- удаление операции
+CREATE OR REPLACE FUNCTION oper_delete (name_project text, name_group text, name_operation text, common_group text) RETURNS integer AS
+$BODY$
+DECLARE
+    id_oper integer;
+begin
+	if CAST(common_group AS boolean) then
+		UPDATE operation
+		SET deleted = true
+		WHERE name = name_operation
+			and id_group = (SELECT gr.id from group_oper gr
+						WHERE gr.name = name_group
+							and gr.deleted = false
+							and gr.common = true
+					   ) RETURNING id into id_oper;
+	else
+		UPDATE operation
+		SET deleted = true
+		WHERE name = name_operation
+			and id_group = (SELECT gr.id from group_oper gr
+						WHERE gr.name = name_group
+						and gr.deleted = false
+						and gr.id_project = (SELECT id from project
+											 WHERE name = name_project
+											 and deleted = false
+											)
+						and gr.common = false
+					   )
+			and deleted = false
+			RETURNING id into id_oper;
+	END IF;
+
+	RETURN id_oper;
+end
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- данные по операции
+CREATE OR REPLACE FUNCTION data_oper_select (name_project text, name_group text, name_operation text, common_group text)
+RETURNS TABLE(dataop text) AS
+$BODY$
+begin
+	if CAST(common_group AS boolean) then
+		return query select op.oper as dataop from operation op
+			join group_oper gr on gr.id = op.id_group
+			where gr.name = name_group
+				and op.name = name_operation
+				and gr.common = true
+				and gr.deleted = false
+				and op.deleted = false;
+	else
+		return query select op.oper as dataop from operation op
+			join group_oper gr on gr.id = op.id_group
+			join project pr on pr.id = gr.id_project
+			where pr.name = name_project
+				and gr.name = name_group
+				and op.name = name_operation
+				and gr.common = false
+				and pr.deleted = false
+				and gr.deleted = false
+				and op.deleted = false;
+	end if;
+end
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- добавление конфига гита
+CREATE OR REPLACE FUNCTION git_scen_insert(name_pr text, url text, login text, pass text, folder text) RETURNS integer AS
+$BODY$
+DECLARE
+    id_conf integer;
+    id_pr integer;
+BEGIN
+	-- получаем id проекта
+    SELECT pr.id INTO id_pr
+	FROM project pr
+	WHERE pr.name = name_pr
+		and pr.deleted = false;
+
+	IF exists(select id from git_scenarios where id_project = id_pr and deleted=false) THEN
+	  update git_scenarios set deleted = true where id_project = id_pr and deleted=false;
+    END IF;
+
+	INSERT INTO git_scenarios(id_project, url, login, pass, folder, deleted)
+	  VALUES (id_pr, url, login, pass, folder, false)
+	  RETURNING id into id_conf;
+
+	RETURN id_conf;
+END
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- удаление конфига гита
+CREATE OR REPLACE FUNCTION git_scen_delete(name_pr text) RETURNS integer AS
+$BODY$
+DECLARE
+    id_conf integer;
+BEGIN
+	update git_scenarios gs
+	set deleted = true
+	where gs.id_project = (select id from project where name = name_pr and deleted = false)
+		and gs.deleted = false
+	  RETURNING id into id_conf;
+
+	RETURN id_conf;
+END
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- получить конфиг гита по проекту
+CREATE OR REPLACE FUNCTION git_scen_select(name_pr text)
+RETURNS TABLE(url text, login text, pass text, folder text) AS
+$BODY$
+BEGIN
+	return query select gs.url, gs.login, gs.pass, gs.folder
+	from git_scenarios gs
+		join project pr on pr.id = gs.id_project
+	where pr.name = name_pr
+		and pr.deleted = false
+		and gs.deleted = false;
+END
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- все проекты
+CREATE OR REPLACE FUNCTION all_projects_select()
+RETURNS TABLE(name_pr text) AS
+$BODY$
+BEGIN
+	return query select CAST(array_to_json(array_agg(pr.name)) AS TEXT) AS name_pr from project pr where pr.deleted=false;
+END
+$BODY$
+LANGUAGE 'plpgsql';
+
+-- все группы и операции по проекту
+CREATE OR REPLACE FUNCTION groups_and_opers_select(name_pr text)
+RETURNS TABLE(group_name text, opers text) AS
+$BODY$
+BEGIN
+	return query select
+			gr.name as group_name,
+			CAST(array_to_json(array_agg(ops.oper::json)) AS TEXT) as opers
+		from group_oper gr
+			join project pr on pr.id = gr.id_project
+			left join (select oper.name, oper.id_group, oper.oper from operation oper where oper.deleted = false) ops on ops.id_group = gr.id
+		where
+			(gr.common = true or (gr.common = false and pr.name = name_pr))
+			and gr.deleted = false
+		group by gr.name;
+END
+$BODY$
+LANGUAGE 'plpgsql';
+
